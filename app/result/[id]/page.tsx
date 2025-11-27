@@ -16,6 +16,74 @@ import {
 import ReactMarkdown from "react-markdown";
 import type { MeetingData } from "@/lib/kv";
 
+const recordingStatusOrder: MeetingData["recording"]["status"][] = [
+  "idle",
+  "starting",
+  "recording",
+  "processing",
+  "available",
+];
+
+type AutomationStep = {
+  status: MeetingData["recording"]["status"];
+  title: string;
+  description: string;
+};
+
+const buildAutomationSteps = (name: string): AutomationStep[] => [
+  {
+    status: "starting",
+    title: `Joining as ${name}`,
+    description: "Bot enters the call muted using your chosen display name.",
+  },
+  {
+    status: "recording",
+    title: "Recording + transcribing live",
+    description: "Audio is captured so you can stay focused elsewhere.",
+  },
+  {
+    status: "processing",
+    title: "Generating clean notes",
+    description: "We polish the transcript into structured notes.",
+  },
+  {
+    status: "available",
+    title: "Saved for later",
+    description: "Recording + notes stay available for 7 days.",
+  },
+];
+
+const getRecordingStatusLabel = (
+  status: MeetingData["recording"]["status"]
+) => {
+  switch (status) {
+    case "starting":
+      return "Joining";
+    case "recording":
+      return "Recording";
+    case "processing":
+      return "Processing";
+    case "available":
+      return "Saved";
+    default:
+      return "Waiting";
+  }
+};
+
+const formatTime = (timestamp?: number) => {
+  if (!timestamp) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+};
+
+const formatDuration = (minutes?: number) => {
+  if (!minutes) return "—";
+  if (minutes < 1) return "< 1 min";
+  return `${minutes} min`;
+};
+
 export default function ResultPage() {
   const params = useParams();
   const router = useRouter();
@@ -120,6 +188,10 @@ export default function ResultPage() {
     }
   };
 
+  const recording: MeetingData["recording"] = data?.recording ?? {
+    status: "idle",
+  };
+
   const handleCopy = async () => {
     if (!data?.notes) return;
     await navigator.clipboard.writeText(data.notes);
@@ -162,6 +234,36 @@ export default function ResultPage() {
     setTimeout(() => setShareCopied(false), 2000);
   };
 
+  const handleRecordingDownload = () => {
+    if (!data) return;
+    const started = recording.startedAt
+      ? new Date(recording.startedAt).toISOString()
+      : "unknown";
+    const ended = recording.endedAt
+      ? new Date(recording.endedAt).toISOString()
+      : "still-recording";
+
+    const summary = `Meeting ID: ${data.id}
+Joined as: ${data.displayName}
+Platform: ${data.platform}
+Recording status: ${recording.status}
+Recording started: ${started}
+Recording ended: ${ended}
+Duration: ${recording.durationMinutes ?? "n/a"} minutes
+
+This file is a placeholder summary representing the recorded audio for demo purposes.`;
+
+    const blob = new Blob([summary], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `meeting-recording-${id}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   if (!data && !loading) {
     return (
       <div className="min-h-screen flex items-center justify-center p-4 bg-[#0a0a0a]">
@@ -179,6 +281,15 @@ export default function ResultPage() {
 
   const statusInfo = data ? getStatusInfo(data.status) : null;
   const StatusIcon = statusInfo?.icon || Loader2;
+  const recordingStatusLabel = getRecordingStatusLabel(recording.status);
+  const platformLabel = data
+    ? data.platform === "zoom"
+      ? "Zoom"
+      : "Google Meet"
+    : "";
+  const automationSteps = buildAutomationSteps(data?.displayName || "you");
+  const recordingIndex = recordingStatusOrder.indexOf(recording.status);
+  const currentRecordingIndex = recordingIndex === -1 ? 0 : recordingIndex;
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] p-4">
@@ -194,7 +305,7 @@ export default function ResultPage() {
           </Button>
 
           {data?.status === "done" && (
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button variant="outline" onClick={handleCopy}>
                 {notesCopied ? (
                   <>
@@ -220,6 +331,120 @@ export default function ResultPage() {
           )}
         </div>
 
+        {data && (
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="bg-[#111] border border-[#222] rounded-lg p-5">
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-xs uppercase tracking-widest text-[#666]">
+                  Live automation
+                </p>
+                <span className="text-sm text-[#aaa]">
+                  {recordingStatusLabel}
+                </span>
+              </div>
+              <div className="space-y-4">
+                {automationSteps.map((step) => {
+                  const stepIndex = recordingStatusOrder.indexOf(step.status);
+                  const isComplete = stepIndex < currentRecordingIndex;
+                  const isActive = stepIndex === currentRecordingIndex;
+
+                  return (
+                    <div
+                      key={step.status}
+                      className="flex items-start gap-3 rounded-lg border border-[#222] bg-[#0f0f0f] p-3"
+                    >
+                      <div className="mt-1">
+                        {isComplete ? (
+                          <CheckCircle2 className="w-4 h-4 text-green-400" />
+                        ) : isActive ? (
+                          <Loader2 className="w-4 h-4 text-[#0066ff] animate-spin" />
+                        ) : (
+                          <div className="w-3 h-3 rounded-full bg-[#333]" />
+                        )}
+                      </div>
+                      <div>
+                        <p className="text-sm text-white font-medium">
+                          {step.title}
+                        </p>
+                        <p className="text-xs text-[#777]">{step.description}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="bg-[#111] border border-[#222] rounded-lg p-5 space-y-4">
+              <div>
+                <p className="text-xs uppercase tracking-widest text-[#666]">
+                  Recording summary
+                </p>
+                <p className="text-lg font-semibold text-white">
+                  Hands-free capture
+                </p>
+              </div>
+              <dl className="grid grid-cols-2 gap-4 text-sm text-[#ccc]">
+                <div>
+                  <dt className="text-[#777]">Joined as</dt>
+                  <dd className="text-white font-medium">
+                    {data.displayName}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-[#777]">Platform</dt>
+                  <dd>{platformLabel}</dd>
+                </div>
+                <div>
+                  <dt className="text-[#777]">Recording</dt>
+                  <dd>
+                    {recording.status === "available"
+                      ? `Saved (${formatDuration(recording.durationMinutes)})`
+                      : `${recordingStatusLabel}`}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-[#777]">Window</dt>
+                  <dd>
+                    {recording.startedAt && recording.endedAt
+                      ? `${formatTime(recording.startedAt)} → ${formatTime(
+                          recording.endedAt
+                        )}`
+                      : recording.startedAt
+                      ? `${formatTime(recording.startedAt)} → live`
+                      : "—"}
+                  </dd>
+                </div>
+                <div className="col-span-2">
+                  <dt className="text-[#777]">Meeting link</dt>
+                  <dd>
+                    <a
+                      href={data.meetingLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[#0066ff] hover:underline break-all"
+                    >
+                      {data.meetingLink}
+                    </a>
+                  </dd>
+                </div>
+              </dl>
+              <Button
+                variant="outline"
+                onClick={handleRecordingDownload}
+                disabled={recording.status !== "available"}
+                className="w-full"
+              >
+                {recording.status === "available"
+                  ? "Download recording summary"
+                  : "Recording in progress"}
+              </Button>
+              <p className="text-xs text-[#555]">
+                Recordings and notes are automatically deleted after 7 days.
+              </p>
+            </div>
+          </div>
+        )}
+
         <div className="bg-[#111] border border-[#222] rounded-lg p-6">
           <div className="flex items-center justify-between mb-4">
             <h1 className="text-2xl font-bold text-white">Meeting Notes</h1>
@@ -236,6 +461,10 @@ export default function ResultPage() {
               </Badge>
             )}
           </div>
+
+          {data?.statusMessage && (
+            <p className="text-sm text-[#888] mb-4">{data.statusMessage}</p>
+          )}
 
           {data?.status === "done" && data.notes ? (
             <div className="space-y-4 text-[#ccc] leading-relaxed">

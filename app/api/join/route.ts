@@ -7,9 +7,31 @@ import { meetingNotesSystemPrompt } from "@/lib/prompt";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { meetingLink, platform, meetingId } = body;
+    const { meetingLink, platform, meetingId, displayName } = body || {};
 
-    if (!meetingLink || !platform || !meetingId) {
+    if (
+      typeof meetingLink !== "string" ||
+      typeof platform !== "string" ||
+      typeof meetingId !== "string" ||
+      typeof displayName !== "string"
+    ) {
+      return NextResponse.json(
+        { error: "Missing required fields" },
+        { status: 400 }
+      );
+    }
+
+    const cleanedLink = meetingLink.trim();
+    const cleanedDisplayName = displayName.trim();
+    const cleanedMeetingId = meetingId.trim();
+    const normalizedPlatform = platform.trim() as MeetingData["platform"];
+
+    if (
+      !cleanedLink ||
+      !cleanedMeetingId ||
+      !cleanedDisplayName ||
+      (normalizedPlatform !== "zoom" && normalizedPlatform !== "google-meet")
+    ) {
       return NextResponse.json(
         { error: "Missing required fields" },
         { status: 400 }
@@ -20,17 +42,22 @@ export async function POST(request: NextRequest) {
 
     const meetingData: MeetingData = {
       id,
-      meetingLink,
-      platform,
-      meetingId,
+      meetingLink: cleanedLink,
+      platform: normalizedPlatform,
+      meetingId: cleanedMeetingId,
+      displayName: cleanedDisplayName,
       status: "waiting",
+      statusMessage: `We’ll join this call as ${cleanedDisplayName} and start recording the moment it begins.`,
+      recording: {
+        status: "idle",
+      },
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
 
     await kv.set(id, meetingData);
 
-    processMeeting(id, platform, meetingId);
+    processMeeting(id, normalizedPlatform, cleanedMeetingId);
 
     return NextResponse.json({ id });
   } catch (error) {
@@ -42,50 +69,103 @@ export async function POST(request: NextRequest) {
   }
 }
 
+type MeetingUpdateInput = Partial<
+  Omit<
+    MeetingData,
+    | "id"
+    | "meetingLink"
+    | "platform"
+    | "meetingId"
+    | "displayName"
+    | "createdAt"
+    | "recording"
+  >
+> & { recording?: Partial<MeetingData["recording"]> };
+
 async function processMeeting(
   id: string,
-  platform: string,
+  platform: MeetingData["platform"],
   meetingId: string
 ) {
   try {
     let data = await kv.get<MeetingData>(id);
     if (!data) return;
 
-    const updateStatus = async (status: MeetingData["status"]) => {
+    const platformLabel = platform === "zoom" ? "Zoom" : "Google Meet";
+
+    const updateMeeting = async (updates: MeetingUpdateInput) => {
+      if (!data) return;
+      const { recording: recordingUpdates, ...rest } = updates;
+
       data = {
-        ...data!,
-        status,
+        ...data,
+        ...rest,
+        recording: recordingUpdates
+          ? { ...data.recording, ...recordingUpdates }
+          : data.recording,
         updatedAt: Date.now(),
       };
+
       await kv.set(id, data);
     };
 
-    await updateStatus("connecting");
+    await updateMeeting({
+      status: "connecting",
+      statusMessage: `Joining the ${platformLabel} call as ${data.displayName}.`,
+      recording: {
+        status: "starting",
+        startedAt: data.recording.startedAt ?? Date.now(),
+      },
+    });
     await delay(1000);
 
-    await updateStatus("transcribing");
+    await updateMeeting({
+      status: "transcribing",
+      statusMessage:
+        "Recording the meeting live so you can stay heads-down on work.",
+      recording: {
+        status: "recording",
+      },
+    });
     await delay(2000);
 
-    await updateStatus("processing");
+    await updateMeeting({
+      status: "processing",
+      statusMessage: "Wrapping up the recording and polishing the notes.",
+      recording: {
+        status: "processing",
+      },
+    });
 
     const mockTranscript = generateMockTranscript(platform, meetingId);
     const notes = await generateNotes(mockTranscript);
 
-    data = {
-      ...data,
-      status: "done",
-      notes,
-      updatedAt: Date.now(),
-    };
+    const startedAt = data.recording.startedAt ?? Date.now();
+    const endedAt = Date.now();
+    const durationMinutes = Math.max(
+      1,
+      Math.round((endedAt - startedAt) / 60000)
+    );
 
-    await kv.set(id, data);
+    await updateMeeting({
+      status: "done",
+      statusMessage: "Recording saved. Notes are ready whenever you are.",
+      notes,
+      recording: {
+        status: "available",
+        endedAt,
+        durationMinutes,
+      },
+    });
   } catch (error) {
     console.error("Error processing meeting:", error);
-    const data = await kv.get<MeetingData>(id);
-    if (data) {
+    const existing = await kv.get<MeetingData>(id);
+    if (existing) {
       await kv.set(id, {
-        ...data,
+        ...existing,
         status: "error",
+        statusMessage:
+          "We couldn’t finish recording this meeting. Please try again.",
         error: error instanceof Error ? error.message : "Unknown error",
         updatedAt: Date.now(),
       });
@@ -95,7 +175,10 @@ async function processMeeting(
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function generateMockTranscript(platform: string, meetingId: string): string {
+function generateMockTranscript(
+  platform: MeetingData["platform"],
+  meetingId: string
+): string {
   const platformLabel = platform === "zoom" ? "Zoom" : "Google Meet";
   return `Simulated ${platformLabel} meeting (${meetingId})
 Meeting started at 10:00 AM

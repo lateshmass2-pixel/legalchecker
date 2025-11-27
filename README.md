@@ -5,10 +5,12 @@ A clean, fast web app that generates AI-powered meeting notes from Zoom and Goog
 ## Features
 
 ✨ **No Login Required** - Just paste and go
+🤖 **Join-as-you Bot** - AI joins the meeting using your display name
+🎙️ **Hands-Free Recording** - Live audio capture while you stay focused elsewhere
 📝 **AI-Powered Notes** - Clean markdown with timestamps, decisions, and action items
 🔄 **Live Status** - Watch your meeting transcribe in real-time
 📋 **Easy Export** - Copy to clipboard or download as `.md`
-🔗 **Shareable Links** - Share notes with your team
+🔗 **Shareable Links** - Share notes and recordings with your team
 🌙 **Dark Mode First** - Beautiful design inspired by Linear and Perplexity
 
 ## Quick Start
@@ -73,14 +75,14 @@ KV_REST_API_TOKEN=your_kv_token
 
 1. **Submit Link** - User pastes Zoom or Google Meet URL
 2. **Extract Meeting ID** - Parse platform and meeting identifier
-3. **Join Meeting** - Bot joins with mic/camera off (in production)
-4. **Transcribe** - Audio → text via Whisper API
+3. **Join & Record** - Bot joins with your display name (mic/camera off) and immediately starts recording
+4. **Transcribe Live** - Audio → text via Whisper API
 5. **Generate Notes** - Claude/Groq creates structured notes with:
    - TL;DR summary
    - Timestamped discussion points
    - Decisions made
    - Action items (Owner — Task — Due)
-6. **Share** - Notes stored for 7 days with public link
+6. **Share** - Notes + recording stored for 7 days with public link
 
 ## System Prompt
 
