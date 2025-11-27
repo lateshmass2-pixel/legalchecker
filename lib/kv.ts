@@ -8,12 +8,29 @@ export type MeetingStatus =
   | "done"
   | "error";
 
+export type RecordingStatus =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "processing"
+  | "available";
+
+export interface MeetingRecording {
+  status: RecordingStatus;
+  startedAt?: number;
+  endedAt?: number;
+  durationMinutes?: number;
+}
+
 export interface MeetingData {
   id: string;
   meetingLink: string;
   platform: "zoom" | "google-meet";
   meetingId: string;
+  displayName: string;
   status: MeetingStatus;
+  statusMessage?: string;
+  recording: MeetingRecording;
   createdAt: number;
   updatedAt: number;
   notes?: string;
