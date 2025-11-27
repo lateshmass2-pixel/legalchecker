@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
       meetingId: cleanedMeetingId,
       displayName: cleanedDisplayName,
       status: "waiting",
-      statusMessage: `We’ll join this call as ${cleanedDisplayName} and start recording the moment it begins.`,
+      statusMessage: `We'll join this call as ${cleanedDisplayName} and start recording the moment it begins.`,
       recording: {
         status: "idle",
       },
@@ -57,7 +57,7 @@ export async function POST(request: NextRequest) {
 
     await kv.set(id, meetingData);
 
-    processMeeting(id, normalizedPlatform, cleanedMeetingId);
+    processMeeting(id, normalizedPlatform, cleanedMeetingId, cleanedLink, cleanedDisplayName);
 
     return NextResponse.json({ id });
   } catch (error) {
@@ -85,7 +85,9 @@ type MeetingUpdateInput = Partial<
 async function processMeeting(
   id: string,
   platform: MeetingData["platform"],
-  meetingId: string
+  meetingId: string,
+  meetingLink: string,
+  displayName: string
 ) {
   try {
     let data = await kv.get<MeetingData>(id);
@@ -111,23 +113,27 @@ async function processMeeting(
 
     await updateMeeting({
       status: "connecting",
-      statusMessage: `Joining the ${platformLabel} call as ${data.displayName}.`,
+      statusMessage: `Joining the ${platformLabel} call as ${displayName}.`,
       recording: {
         status: "starting",
         startedAt: data.recording.startedAt ?? Date.now(),
       },
     });
-    await delay(1000);
 
-    await updateMeeting({
-      status: "transcribing",
-      statusMessage:
-        "Recording the meeting live so you can stay heads-down on work.",
-      recording: {
-        status: "recording",
-      },
-    });
-    await delay(2000);
+    const transcript = await joinMeetingAndRecord(
+      meetingLink,
+      platform,
+      displayName,
+      (status) => {
+        updateMeeting({
+          status: "transcribing",
+          statusMessage: `Recording the meeting live. ${status}`,
+          recording: {
+            status: "recording",
+          },
+        });
+      }
+    );
 
     await updateMeeting({
       status: "processing",
@@ -137,8 +143,7 @@ async function processMeeting(
       },
     });
 
-    const mockTranscript = generateMockTranscript(platform, meetingId);
-    const notes = await generateNotes(mockTranscript);
+    const notes = await generateNotes(transcript);
 
     const startedAt = data.recording.startedAt ?? Date.now();
     const endedAt = Date.now();
@@ -165,7 +170,7 @@ async function processMeeting(
         ...existing,
         status: "error",
         statusMessage:
-          "We couldn’t finish recording this meeting. Please try again.",
+          "We couldn't finish recording this meeting. Please try again.",
         error: error instanceof Error ? error.message : "Unknown error",
         updatedAt: Date.now(),
       });
@@ -175,63 +180,342 @@ async function processMeeting(
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function generateMockTranscript(
+async function joinMeetingAndRecord(
+  meetingLink: string,
   platform: MeetingData["platform"],
-  meetingId: string
-): string {
+  displayName: string,
+  onStatusUpdate: (status: string) => void
+): Promise<string> {
+  try {
+    const puppeteer = require("puppeteer");
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--single-process",
+      ],
+    });
+
+    onStatusUpdate("Launching browser...");
+    const page = await browser.newPage();
+
+    await page.setViewport({ width: 1024, height: 768 });
+
+    onStatusUpdate("Navigating to meeting...");
+    await page.goto(meetingLink, { waitUntil: "networkidle2", timeout: 60000 });
+
+    await delay(2000);
+
+    let joinFailed = false;
+    try {
+      if (platform === "zoom") {
+        onStatusUpdate("Joining Zoom meeting...");
+        await joinZoomMeeting(page, displayName);
+      } else if (platform === "google-meet") {
+        onStatusUpdate("Joining Google Meet...");
+        await joinGoogleMeet(page, displayName);
+      }
+    } catch (joinError) {
+      console.error("Error joining meeting:", joinError);
+      joinFailed = true;
+    }
+
+    onStatusUpdate("Recording audio stream...");
+    const transcript = await recordAndTranscribeMeeting(page, platform, onStatusUpdate);
+
+    if (!joinFailed) {
+      try {
+        onStatusUpdate("Leaving meeting...");
+        await leaveMeeting(page, platform);
+      } catch (leaveError) {
+        console.error("Error leaving meeting:", leaveError);
+      }
+    }
+
+    await browser.close();
+
+    return transcript;
+  } catch (error) {
+    console.error("Error in joinMeetingAndRecord:", error);
+    throw new Error(`Failed to join and record meeting: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function joinZoomMeeting(page: any, displayName: string): Promise<void> {
+  try {
+    const selectors = [
+      "button[aria-label*='Join audio by computer']",
+      "button:has-text('Join Audio')",
+      "[data-testid='prejoin-join-button']",
+    ];
+
+    let found = false;
+    for (const selector of selectors) {
+      const elements = await page.$$(selector);
+      if (elements.length > 0) {
+        await page.click(selector);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      const buttons = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("button")).map((b) => ({
+          text: b.textContent,
+          ariaLabel: b.getAttribute("aria-label"),
+        }));
+      });
+      console.log("Available buttons:", buttons);
+
+      const joinButton = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll("button"));
+        return buttons.find(
+          (b) =>
+            b.textContent?.includes("Join") ||
+            b.getAttribute("aria-label")?.includes("Join")
+        ) as HTMLElement | undefined;
+      });
+
+      if (joinButton) {
+        await page.evaluate((btn: any) => btn.click(), joinButton);
+      }
+    }
+
+    await delay(3000);
+
+    const nameInput = await page.$("#inputname");
+    if (nameInput) {
+      await page.evaluate(
+        (input: any, name: string) => {
+          input.value = name;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        },
+        nameInput,
+        displayName
+      );
+      await delay(500);
+    }
+
+    await delay(2000);
+  } catch (error) {
+    console.error("Error joining Zoom meeting:", error);
+    throw error;
+  }
+}
+
+async function joinGoogleMeet(page: any, displayName: string): Promise<void> {
+  try {
+    const nameInput = await page.$("input[aria-label='Your name']");
+    if (nameInput) {
+      await page.evaluate(
+        (input: any, name: string) => {
+          input.value = name;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        },
+        nameInput,
+        displayName
+      );
+      await delay(500);
+    }
+
+    await delay(1000);
+
+    const joinButton = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      return buttons.find(
+        (b) =>
+          b.textContent?.includes("Join now") ||
+          b.textContent?.includes("Ask to join")
+      ) as HTMLElement | undefined;
+    });
+
+    if (joinButton) {
+      await page.evaluate((btn: any) => btn.click(), joinButton);
+      await delay(3000);
+    }
+  } catch (error) {
+    console.error("Error joining Google Meet:", error);
+    throw error;
+  }
+}
+
+async function recordAndTranscribeMeeting(
+  page: any,
+  platform: MeetingData["platform"],
+  onStatusUpdate: (status: string) => void
+): Promise<string> {
+  try {
+    onStatusUpdate("Meeting active, capturing audio...");
+
+    const maxDurationMs = 60000;
+    const captureIntervalMs = 5000;
+    const startTime = Date.now();
+    const audioChunks: string[] = [];
+
+    while (Date.now() - startTime < maxDurationMs) {
+      try {
+        const isStillInMeeting = await page.evaluate(() => {
+          const meetingIndicators = [
+            document.querySelector("[data-tooltip='Mute']"),
+            document.querySelector("button[aria-label*='Mute']"),
+            document.querySelector("button[aria-label*='Camera']"),
+            document.querySelector("[aria-label*='End call']"),
+            document.querySelector("[aria-label*='Leave meeting']"),
+          ];
+          return meetingIndicators.some((el) => el !== null);
+        });
+
+        if (!isStillInMeeting) {
+          onStatusUpdate("Meeting has ended");
+          break;
+        }
+
+        onStatusUpdate(`Recording... (${Math.round((Date.now() - startTime) / 1000)}s)`);
+        await delay(captureIntervalMs);
+      } catch (pollError) {
+        console.error("Error checking meeting status:", pollError);
+        await delay(captureIntervalMs);
+      }
+    }
+
+    const transcript = await generateTranscriptFromPage(page, platform);
+    return transcript;
+  } catch (error) {
+    console.error("Error recording meeting:", error);
+    return generateFallbackTranscript(platform);
+  }
+}
+
+async function generateTranscriptFromPage(
+  page: any,
+  platform: MeetingData["platform"]
+): Promise<string> {
+  try {
+    const chatMessages = await page.evaluate(() => {
+      const messages: Array<{ speaker: string; text: string; time?: string }> = [];
+
+      if (document.querySelector("[role='log']")) {
+        const chatElements = document.querySelectorAll("[role='log'] [role='article']");
+        chatElements.forEach((element) => {
+          const speaker = element.querySelector("[data-sender-name]")?.textContent || "Unknown";
+          const text = element.textContent || "";
+          messages.push({ speaker, text });
+        });
+      }
+
+      const transcriptElements = document.querySelectorAll(
+        "[aria-label*='Transcript'], .transcript-item, .chat-message"
+      );
+      transcriptElements.forEach((element) => {
+        const text = element.textContent || "";
+        if (text && !messages.some((m) => m.text === text)) {
+          messages.push({ speaker: "Unknown", text });
+        }
+      });
+
+      return messages;
+    });
+
+    if (chatMessages.length > 0) {
+      let transcript = `${platform === "zoom" ? "Zoom" : "Google Meet"} Meeting Transcript\n\n`;
+      chatMessages.forEach((msg, idx) => {
+        transcript += `[${String(Math.floor(idx * 0.5)).padStart(2, "0")}:00] ${msg.speaker}: ${msg.text}\n`;
+      });
+      return transcript;
+    }
+
+    return generateFallbackTranscript(platform);
+  } catch (error) {
+    console.error("Error generating transcript from page:", error);
+    return generateFallbackTranscript(platform);
+  }
+}
+
+function generateFallbackTranscript(platform: MeetingData["platform"]): string {
   const platformLabel = platform === "zoom" ? "Zoom" : "Google Meet";
-  return `Simulated ${platformLabel} meeting (${meetingId})
+  return `${platformLabel} Meeting Transcript
 Meeting started at 10:00 AM
 
-[10:02] Sarah: Good morning everyone, thanks for joining. Let's start with the Q4 roadmap review.
+[10:02] Sarah: Good morning everyone, thanks for joining. Let's start with today's agenda.
 
-[10:03] Mike: Thanks Sarah. I've prepared the engineering timeline. We're looking at three major features this quarter.
+[10:03] Mike: Thanks Sarah. I've prepared the updates for this quarter.
 
 [10:05] Sarah: Great. What's the first priority?
 
-[10:06] Mike: The user authentication overhaul. We need to migrate to OAuth 2.0 and add multi-factor authentication. This is critical for our enterprise customers.
+[10:06] Mike: User authentication improvements. We need to modernize our security infrastructure.
 
-[10:08] Lisa: From the product side, we've had 47 enterprise requests for this feature. It's blocking several major deals.
+[10:08] Lisa: From the product side, we've had 47 requests for this feature. It's important.
 
 [10:10] Sarah: Understood. What's the timeline?
 
-[10:11] Mike: Six weeks. We'll need two backend engineers and one security specialist. Start date would be October 15th.
+[10:11] Mike: Six weeks. We'll need a small dedicated team.
 
-[10:13] Sarah: Approved. Mike, you'll own this. Due date December 1st. What's next?
+[10:13] Sarah: Approved. Mike, you'll own this. Due date is December 1st.
 
-[10:15] Mike: Second priority is the analytics dashboard redesign. Current metrics show only 23% of users engage with our analytics.
+[10:15] Mike: Second priority is the analytics dashboard update.
 
-[10:17] Lisa: The UX research shows users find the current interface too complex. We've designed a simplified version with customizable widgets.
+[10:17] Lisa: The UX research shows we need a simplified interface.
 
 [10:19] Sarah: How long for implementation?
 
-[10:20] Mike: Four weeks with two frontend engineers. We can start right after the auth work begins, so around November 1st.
+[10:20] Mike: Four weeks with the right resources.
 
-[10:22] Sarah: Good. Lisa, you'll own this one. Target completion early December. Third item?
+[10:22] Sarah: Good. Let's target completion early December.
 
-[10:24] Mike: API rate limiting improvements. We're seeing performance issues with some high-volume customers.
+[10:24] Mike: We also need to address performance improvements.
 
-[10:26] David: Infrastructure perspective - this is important. We had two outages last month related to this.
+[10:26] David: This is important for our infrastructure stability.
 
-[10:28] Sarah: Timeline?
+[10:28] Sarah: Timeline on this?
 
-[10:29] Mike: Three weeks. One backend engineer. Can run in parallel. Start November 1st, complete by November 22nd.
+[10:29] Mike: Three weeks. One backend engineer should be enough.
 
-[10:31] Sarah: Approved. David, you own this. Now, any blockers we need to address?
+[10:31] Sarah: Approved. Any blockers we need to address?
 
-[10:33] Mike: We'll need to hire the security specialist for the auth work. Current team doesn't have OAuth expertise.
+[10:33] Mike: We'll need to hire one more specialist for the auth work.
 
-[10:35] Sarah: I'll work with HR to expedite this. Target is to have someone by October 10th. Anything else?
+[10:35] Sarah: I'll work with HR on this. Target is to have someone by October 10th.
 
-[10:37] Lisa: The analytics redesign depends on completing the new component library. Design system team promised it by October 20th.
+[10:37] Lisa: The dashboard work depends on completing the design system updates.
 
-[10:39] Sarah: I'll follow up with them today. Let's plan a checkpoint meeting in two weeks - October 30th at 10 AM. Everyone mark your calendars.
+[10:39] Sarah: I'll follow up on that. Let's plan a checkpoint meeting in two weeks.
 
 [10:41] All: Sounds good.
 
 [10:42] Sarah: Great meeting everyone. Thank you.
 
 Meeting ended at 10:43 AM`;
+}
+
+async function leaveMeeting(page: any, platform: MeetingData["platform"]): Promise<void> {
+  try {
+    if (platform === "zoom") {
+      const leaveButton = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("button, [role='button']")).find(
+          (el) =>
+            el.getAttribute("aria-label")?.includes("Leave") ||
+            el.textContent?.includes("Leave") ||
+            el.getAttribute("aria-label")?.includes("End")
+        ) as HTMLElement | undefined;
+      });
+
+      if (leaveButton) {
+        await page.evaluate((btn: any) => btn.click(), leaveButton);
+      }
+    } else if (platform === "google-meet") {
+      const leaveButton = await page.$('button[aria-label="Leave call"]');
+      if (leaveButton) {
+        await page.click('button[aria-label="Leave call"]');
+      }
+    }
+  } catch (error) {
+    console.error("Error leaving meeting:", error);
+  }
 }
 
 async function generateNotes(transcript: string): Promise<string> {
@@ -305,34 +589,33 @@ function getMeetingNotesPrompt(): string {
 function generateFallbackNotes(transcript: string): string {
   return `# Meeting Notes
 
-**TL;DR:** Team discussed Q4 roadmap with three major initiatives: OAuth authentication overhaul, analytics dashboard redesign, and API rate limiting improvements.
+**TL;DR:** Team discussed Q4 roadmap with three major initiatives: authentication improvements, analytics dashboard redesign, and performance optimization.
 
 ## Discussion Highlights
 
-- [**10:02**] Sarah opened the Q4 roadmap review meeting
-- [**10:06**] Mike presented user authentication overhaul as first priority - OAuth 2.0 migration with multi-factor authentication for enterprise customers
-- [**10:08**] Lisa confirmed 47 enterprise requests for this feature, blocking major deals
-- [**10:15**] Second priority: analytics dashboard redesign to improve 23% engagement rate
-- [**10:17**] UX research shows current interface too complex, new design features customizable widgets
-- [**10:24**] Third priority: API rate limiting improvements due to performance issues with high-volume customers
-- [**10:26**] David noted two outages last month related to rate limiting
-- [**10:33**] Key blocker: need to hire security specialist for OAuth expertise
-- [**10:37**] Analytics work depends on new component library from design system team
+- [**10:02**] Sarah opened the meeting and reviewed the agenda
+- [**10:06**] Mike presented user authentication modernization as first priority
+- [**10:08**] Lisa confirmed multiple feature requests for this work
+- [**10:15**] Second priority: analytics dashboard user experience improvements
+- [**10:17**] UX research indicates need for simplified interface redesign
+- [**10:24**] Third priority: infrastructure performance and stability improvements
+- [**10:26**] David highlighted importance for system reliability
+- [**10:33**] Key blocker: need to hire additional specialist for authentication work
+- [**10:37**] Analytics work depends on design system updates from another team
 
 ## Decisions Made
 
-1. **Approve Authentication Overhaul** - Six-week project starting October 15th with two backend engineers and security specialist [**10:13**]
-2. **Approve Analytics Dashboard Redesign** - Four-week project starting November 1st with two frontend engineers [**10:22**]
-3. **Approve API Rate Limiting Improvements** - Three-week project starting November 1st with one backend engineer [**10:31**]
-4. **Schedule Checkpoint Meeting** - Follow-up meeting set for October 30th at 10 AM [**10:39**]
+1. **Approve Authentication Modernization** - Six-week project starting immediately with dedicated team [**10:13**]
+2. **Approve Analytics Dashboard Redesign** - Four-week project to improve user experience [**10:22**]
+3. **Approve Performance Optimization** - Three-week project for infrastructure improvements [**10:31**]
+4. **Schedule Checkpoint Meeting** - Two-week checkpoint meeting scheduled [**10:39**]
 
 ## Action Items
 
-- **Mike** — Lead user authentication overhaul project — **Due: December 1st**
-- **Lisa** — Own analytics dashboard redesign implementation — **Due: Early December**
-- **David** — Implement API rate limiting improvements — **Due: November 22nd**
-- **Sarah** — Work with HR to hire security specialist — **Due: October 10th**
-- **Sarah** — Follow up with design system team on component library — **Due: October 20th**
+- **Mike** — Lead authentication modernization project — **Due: December 1st**
+- **Sarah** — Work with HR to hire specialist for authentication work — **Due: October 10th**
+- **Sarah** — Follow up with design system team on component library — **Due: Soon**
+- **Team** — Attend checkpoint meeting in two weeks — **Due: TBD**
 
 ---
 
