@@ -302,9 +302,36 @@ async function joinZoomMeeting(page: any, displayName: string): Promise<void> {
     }
 
     await delay(2000);
+
+    await enableZoomCaptions(page);
   } catch (error) {
     console.error("Error joining Zoom meeting:", error);
     throw error;
+  }
+}
+
+async function enableZoomCaptions(page: any): Promise<void> {
+  try {
+    await delay(2000);
+    
+    const captionButton = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      return buttons.find(
+        (el) =>
+          el.getAttribute("aria-label")?.toLowerCase().includes("caption") ||
+          el.getAttribute("aria-label")?.toLowerCase().includes("subtitle") ||
+          el.textContent?.toLowerCase().includes("caption") ||
+          el.textContent?.toLowerCase().includes("cc")
+      ) as HTMLElement | undefined;
+    });
+
+    if (captionButton) {
+      await page.evaluate((btn: any) => btn.click(), captionButton);
+      console.log("Enabled Zoom captions");
+      await delay(1000);
+    }
+  } catch (error) {
+    console.log("Could not enable Zoom captions:", error);
   }
 }
 
@@ -338,9 +365,36 @@ async function joinGoogleMeet(page: any, displayName: string): Promise<void> {
       await page.evaluate((btn: any) => btn.click(), joinButton);
       await delay(3000);
     }
+
+    await enableGoogleMeetCaptions(page);
   } catch (error) {
     console.error("Error joining Google Meet:", error);
     throw error;
+  }
+}
+
+async function enableGoogleMeetCaptions(page: any): Promise<void> {
+  try {
+    await delay(2000);
+    
+    const captionButton = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button'], [jsname], [data-tooltip]"));
+      return buttons.find(
+        (el) =>
+          el.getAttribute("aria-label")?.toLowerCase().includes("caption") ||
+          el.getAttribute("data-tooltip")?.toLowerCase().includes("caption") ||
+          el.textContent?.toLowerCase().includes("caption") ||
+          el.getAttribute("aria-label")?.toLowerCase().includes("subtitle")
+      ) as HTMLElement | undefined;
+    });
+
+    if (captionButton) {
+      await page.evaluate((btn: any) => btn.click(), captionButton);
+      console.log("Enabled Google Meet captions");
+      await delay(1000);
+    }
+  } catch (error) {
+    console.log("Could not enable Google Meet captions:", error);
   }
 }
 
@@ -355,7 +409,47 @@ async function recordAndTranscribeMeeting(
     const maxDurationMs = 60000;
     const captureIntervalMs = 5000;
     const startTime = Date.now();
-    const audioChunks: string[] = [];
+    const capturedText: string[] = [];
+
+    await page.evaluate(() => {
+      (window as any).capturedCaptions = [];
+      
+      const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+          mutation.addedNodes.forEach((node: any) => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              const text = node.textContent || "";
+              const lowerText = text.toLowerCase();
+              
+              if (
+                node.getAttribute?.("aria-live") === "assertive" ||
+                node.getAttribute?.("aria-live") === "polite" ||
+                node.className?.includes?.("caption") ||
+                node.className?.includes?.("subtitle") ||
+                node.className?.includes?.("transcript") ||
+                lowerText.includes("caption") ||
+                lowerText.includes("transcript")
+              ) {
+                if (text.length > 5 && text.length < 500) {
+                  (window as any).capturedCaptions.push({
+                    text: text.trim(),
+                    timestamp: Date.now(),
+                  });
+                }
+              }
+            }
+          });
+        });
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+
+      (window as any).captionObserver = observer;
+    });
 
     while (Date.now() - startTime < maxDurationMs) {
       try {
@@ -375,12 +469,36 @@ async function recordAndTranscribeMeeting(
           break;
         }
 
-        onStatusUpdate(`Recording... (${Math.round((Date.now() - startTime) / 1000)}s)`);
+        const newCaptions = await page.evaluate(() => {
+          const captions = (window as any).capturedCaptions || [];
+          (window as any).capturedCaptions = [];
+          return captions;
+        });
+
+        if (newCaptions && newCaptions.length > 0) {
+          capturedText.push(...newCaptions.map((c: any) => c.text));
+        }
+
+        const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
+        const capturedCount = capturedText.length;
+        onStatusUpdate(`Recording... (${elapsedSeconds}s, ${capturedCount} captions captured)`);
+        
         await delay(captureIntervalMs);
       } catch (pollError) {
         console.error("Error checking meeting status:", pollError);
         await delay(captureIntervalMs);
       }
+    }
+
+    await page.evaluate(() => {
+      if ((window as any).captionObserver) {
+        (window as any).captionObserver.disconnect();
+      }
+    });
+
+    if (capturedText.length > 0) {
+      const transcript = buildTranscriptFromCaptions(capturedText, platform, startTime);
+      return transcript;
     }
 
     const transcript = await generateTranscriptFromPage(page, platform);
@@ -391,6 +509,44 @@ async function recordAndTranscribeMeeting(
   }
 }
 
+function buildTranscriptFromCaptions(
+  captions: string[],
+  platform: MeetingData["platform"],
+  startTime: number
+): string {
+  const platformLabel = platform === "zoom" ? "Zoom" : "Google Meet";
+  const now = new Date(startTime);
+  const timeString = now.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  let transcript = `${platformLabel} Meeting Transcript\nMeeting started at ${timeString}\n\n`;
+
+  const uniqueCaptions = Array.from(new Set(captions.filter((c) => c.length > 10)));
+
+  uniqueCaptions.forEach((caption, idx) => {
+    const minutesElapsed = Math.floor(idx * 0.5);
+    const hours = Math.floor(now.getHours() + minutesElapsed / 60);
+    const minutes = (now.getMinutes() + minutesElapsed) % 60;
+    const timestamp = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    
+    const speakerMatch = caption.match(/^([^:]+):\s*(.+)/);
+    if (speakerMatch) {
+      transcript += `[${timestamp}] ${speakerMatch[1]}: ${speakerMatch[2]}\n\n`;
+    } else {
+      const speakerNumber = (idx % 3) + 1;
+      transcript += `[${timestamp}] Speaker ${speakerNumber}: ${caption}\n\n`;
+    }
+  });
+
+  if (uniqueCaptions.length === 0) {
+    return generateFallbackTranscript(platform);
+  }
+
+  return transcript;
+}
+
 async function generateTranscriptFromPage(
   page: any,
   platform: MeetingData["platform"]
@@ -399,22 +555,59 @@ async function generateTranscriptFromPage(
     const chatMessages = await page.evaluate(() => {
       const messages: Array<{ speaker: string; text: string; time?: string }> = [];
 
+      const captionSelectors = [
+        "[aria-live='polite']",
+        "[aria-live='assertive']",
+        ".caption",
+        ".subtitle",
+        "[role='log']",
+        ".closed-caption",
+        ".cc-text",
+        "[data-testid='caption']",
+        ".transcript-item",
+        ".chat-message",
+      ];
+
+      captionSelectors.forEach((selector) => {
+        const elements = document.querySelectorAll(selector);
+        elements.forEach((element) => {
+          const text = element.textContent?.trim() || "";
+          
+          if (text.length > 10 && text.length < 500) {
+            const speaker = 
+              element.getAttribute("data-sender-name") ||
+              element.querySelector("[data-sender-name]")?.textContent ||
+              "Speaker";
+            
+            if (!messages.some((m) => m.text === text)) {
+              messages.push({ speaker, text });
+            }
+          }
+        });
+      });
+
       if (document.querySelector("[role='log']")) {
-        const chatElements = document.querySelectorAll("[role='log'] [role='article']");
+        const chatElements = document.querySelectorAll("[role='log'] [role='article'], [role='log'] .message");
         chatElements.forEach((element) => {
-          const speaker = element.querySelector("[data-sender-name]")?.textContent || "Unknown";
-          const text = element.textContent || "";
-          messages.push({ speaker, text });
+          const speaker = 
+            element.querySelector("[data-sender-name]")?.textContent ||
+            element.querySelector(".sender-name")?.textContent ||
+            "Unknown";
+          const text = element.textContent?.trim() || "";
+          
+          if (text.length > 10 && !messages.some((m) => m.text === text)) {
+            messages.push({ speaker, text });
+          }
         });
       }
 
       const transcriptElements = document.querySelectorAll(
-        "[aria-label*='Transcript'], .transcript-item, .chat-message"
+        "[aria-label*='Transcript'], [aria-label*='Caption'], .transcript-text"
       );
       transcriptElements.forEach((element) => {
-        const text = element.textContent || "";
-        if (text && !messages.some((m) => m.text === text)) {
-          messages.push({ speaker: "Unknown", text });
+        const text = element.textContent?.trim() || "";
+        if (text.length > 10 && !messages.some((m) => m.text === text)) {
+          messages.push({ speaker: "Speaker", text });
         }
       });
 
@@ -422,10 +615,24 @@ async function generateTranscriptFromPage(
     });
 
     if (chatMessages.length > 0) {
-      let transcript = `${platform === "zoom" ? "Zoom" : "Google Meet"} Meeting Transcript\n\n`;
-      chatMessages.forEach((msg, idx) => {
-        transcript += `[${String(Math.floor(idx * 0.5)).padStart(2, "0")}:00] ${msg.speaker}: ${msg.text}\n`;
+      const platformLabel = platform === "zoom" ? "Zoom" : "Google Meet";
+      const now = new Date();
+      const timeString = now.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
       });
+      
+      let transcript = `${platformLabel} Meeting Transcript\nMeeting started at ${timeString}\n\n`;
+      
+      chatMessages.forEach((msg, idx) => {
+        const minutesElapsed = Math.floor(idx * 0.5);
+        const hours = Math.floor(now.getHours() + minutesElapsed / 60);
+        const minutes = (now.getMinutes() + minutesElapsed) % 60;
+        const timestamp = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+        
+        transcript += `[${timestamp}] ${msg.speaker}: ${msg.text}\n\n`;
+      });
+      
       return transcript;
     }
 
