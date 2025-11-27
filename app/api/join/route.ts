@@ -624,7 +624,7 @@ async function generateTranscriptFromPage(
       
       let transcript = `${platformLabel} Meeting Transcript\nMeeting started at ${timeString}\n\n`;
       
-      chatMessages.forEach((msg, idx) => {
+      chatMessages.forEach((msg: { speaker: string; text: string; time?: string }, idx: number) => {
         const minutesElapsed = Math.floor(idx * 0.5);
         const hours = Math.floor(now.getHours() + minutesElapsed / 60);
         const minutes = (now.getMinutes() + minutesElapsed) % 60;
